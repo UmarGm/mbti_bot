@@ -1,0 +1,34 @@
+from openai import OpenAI
+import base64
+from pathlib import Path
+
+client = OpenAI()
+
+output_dir = Path(".")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+prompts = [
+    f"abstract minimal background, soft gradient colors, smooth shapes, no text, no people, {color}"
+    for color in [
+        "violet", "peach", "turquoise", "blue", "sand", "lavender", "mint", "rose", "amber", "sky blue",
+        "aqua", "salmon", "teal", "sunset orange", "gold", "light purple", "green", "cream", "copper", "silver",
+        "deep blue", "lilac", "warm gray", "soft pink", "seafoam", "amethyst", "indigo", "pearl white", "pastel red", "tangerine",
+        "emerald", "coral", "pastel yellow", "light cyan", "moss green", "magenta", "navy blue", "blush", "beige", "denim blue"
+    ]
+]
+
+for i, prompt in enumerate(prompts, start=1):
+    result = client.images.generate(
+        model="gpt-image-1",
+        prompt=prompt,
+        size="768x768"
+    )
+    image_base64 = result.data[0].b64_json
+    image_bytes = base64.b64decode(image_base64)
+    with open(output_dir / f"{i}.jpg", "wb") as f:
+        f.write(image_bytes)
+    print(f"✅ Saved {i}.jpg")
+
+print("🎨 All 40 images generated successfully!")
+
+

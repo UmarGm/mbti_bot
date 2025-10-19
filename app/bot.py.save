@@ -1,0 +1,805 @@
+import os
+import json
+import time
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import Command
+from aiogram.filters.command import CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+
+from dotenv import load_dotenv
+
+# === Local modules ===
+from mbti import mbti_from_traits, validate_questions  # твой файл
+from keyboards import kb_for_question, kb_after_free, kb_start_test
+
+logging.basicConfig(level=logging.INFO)
+
+# === .env / settings ===
+load_dotenv()
+settings = SimpleNamespace(
+    bot_token=os.getenv("BOT_TOKEN", ""),
+    currency=os.getenv("CURRENCY", "XTR").upper(),            # XTR для Stars
+    price_full_report=int(os.getenv("PRICE_FULL_REPORT", "9900")),
+    pay_provider_token=os.getenv("PAY_PROVIDER_TOKEN", ""),   # токен провайдера для карт
+    card_currency=os.getenv("CARD_CURRENCY", "USD").upper(),  # валюта для карт
+    price_full_report_card=int(os.getenv("PRICE_FULL_REPORT_CARD", os.getenv("PRICE_FULL_REPORT", "9900"))),
+)
+
+# --- Fail-fast: без токена не стартуем явно и понятно
+if not settings.bot_token:
+    raise RuntimeError("BOT_TOKEN не задан в .env")
+
+# === Bot / Dispatcher ===
+bot = Bot(
+    token=settings.bot_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher(storage=MemoryStorage())
+
+# === Paths ===
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+ASSETS_DIR = DATA_DIR / "assets"
+IMAGES_DIR = DATA_DIR / "images"
+
+# === Descriptions ===
+with open(DATA_DIR / "descriptions_short.json", "r", encoding="utf-8") as f:
+    DESCR_SHORT: Dict[str, str] = json.load(f)
+with open(DATA_DIR / "descriptions_long.json", "r", encoding="utf-8") as f:
+    DESCR_LONG: Dict[str, str] = json.load(f)
+
+# === Questions loader (поддерживает разные форматы) ===
+def load_questions():
+    free, paid = [], []
+    q_path = DATA_DIR / "questions.json"
+    if not q_path.exists():
+        raise FileNotFoundError("data/questions.json не найден")
+
+    with open(q_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Вариант 1: {"free":[...], "paid":[...]}
+    if isinstance(data, dict):
+        free = data.get("free") or data.get("FREE") or []
+        paid = data.get("paid") or data.get("PAID") or []
+    # Вариант 2: [ {...}, ... ] — тогда это free, а paid читаем из questions_paid.json (если есть)
+    elif isinstance(data, list):
+        free = data
+        qp = DATA_DIR / "questions_paid.json"
+        if qp.exists():
+            with open(qp, "r", encoding="utf-8") as pf:
+                paid = json.load(pf)
+    else:
+        raise ValueError("Неизвестный формат questions.json")
+
+    if not isinstance(free, list) or not isinstance(paid, list):
+        raise ValueError("Ожидались списки вопросов для free/paid")
+
+    return free, paid
+
+QUESTIONS_FREE, QUESTIONS_PAID = load_questions()
+# Валидация (твоя функция допускает список словарей с полями text/options/trait)
+try:
+    validate_questions(QUESTIONS_FREE)
+    validate_questions(QUESTIONS_PAID)
+except Exception as e:
+    logging.warning("validate_questions warning: %s", e)
+
+# === Runtime state ===
+PAID_USERS: set[int] = set()
+LAST_MBTI: dict[int, str] = {}
+LAST_FREE_TRAITS: dict[int, list[str]] = {}
+LAST_PAID_TRAITS: dict[int, list[str]] = {}
+
+# MBTI Souls (ауры по сообщениям)
+AURA_STATE: dict[int, dict[int, dict[str, int]]] = {}
+
+# Persist
+STATE_FILE = DATA_DIR / "state.json"
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            data = json.load(STATE_FILE.open("r", encoding="utf-8"))
+            PAID_USERS.update(data.get("paid_users", []))
+            LAST_MBTI.update({int(k): v for k, v in data.get("last_mbti", {}).items()})
+            LAST_FREE_TRAITS.update({int(k): v for k, v in data.get("last_free_traits", {}).items()})
+            LAST_PAID_TRAITS.update({int(k): v for k, v in data.get("last_paid_traits", {}).items()})
+            aura_in = data.get("aura_state", {})
+            for chat_id, users in aura_in.items():
+                AURA_STATE[int(chat_id)] = {int(uid): udata for uid, udata in users.items()}
+            logging.info("State loaded from %s", STATE_FILE)
+        except Exception as e:
+            logging.warning("Failed to load state: %s", e)
+
+def save_state():
+    try:
+        json.dump(
+            {
+                "paid_users": list(PAID_USERS),
+                "last_mbti": LAST_MBTI,
+                "last_free_traits": LAST_FREE_TRAITS,
+                "last_paid_traits": LAST_PAID_TRAITS,
+                "aura_state": AURA_STATE,
+            },
+            STATE_FILE.open("w", encoding="utf-8"),
+            ensure_ascii=False,
+            indent=2
+        )
+    except Exception as e:
+        logging.warning("Failed to save state: %s", e)
+
+load_state()
+
+# === Anti-spam (усилен) ===
+LAST_HIT: dict[int, float] = {}      # user_id -> last time
+LAST_CB_HIT: dict[int, float] = {}   # user_id -> last cb time
+MIN_INTERVAL = 1.0                   # сек на сообщение (было 0.7)
+MIN_CB_INTERVAL = 0.6                # сек на клик (было 0.4)
+
+async def throttle_message(message: types.Message) -> bool:
+    now = time.time()
+    uid = message.from_user.id
+    last = LAST_HIT.get(uid, 0.0)
+    if now - last < MIN_INTERVAL:
+        return True
+    LAST_HIT[uid] = now
+    return False
+
+async def throttle_callback(call: types.CallbackQuery) -> bool:
+    now = time.time()
+    uid = call.from_user.id
+    last = LAST_CB_HIT.get(uid, 0.0)
+    if now - last < MIN_CB_INTERVAL:
+        try:
+            await call.answer("Секунду…", cache_time=1)
+        except Exception:
+            pass
+        return True
+    LAST_CB_HIT[uid] = now
+    return False
+
+# === FSM ===
+class FreeTest(StatesGroup):
+    answering = State()
+
+class PaidTest(StatesGroup):
+    answering = State()
+
+# === Helpers ===
+def path_or_none(p: Path) -> FSInputFile | None:
+    try:
+        if p.exists():
+            return FSInputFile(str(p))
+    except Exception:
+        pass
+    return None
+
+# === START ===
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
+    if await throttle_message(message):
+        return
+    await state.clear()
+
+    # диплинк после внешней оплаты (если такое используешь)
+    if command.args == "access_ok":
+        PAID_USERS.add(message.from_user.id)
+        save_state()
+        await message.answer("Доступ подтверждён. Продолжаем тест.")
+        await start_paid_block(message.chat.id, state)
+        return
+
+    # отправляем приветственную картинку, если есть
+    start_img = path_or_none(ASSETS_DIR / "start.png")
+    caption = (
+        "👋 Привет! Это MBTI-бот.\n\n"
+        "• Пройди бесплатный короткий тест — 16 вопросов.\n"
+        "• Затем открой доступ к 20 уточняющим и получи развёрнутый отчёт.\n\n"
+        "Интерактивы в чате — бесплатно: /ice /quiz /whoami /daily /compat /meme\n"
+        "Уникально: /aura /souls /reflect"
+    )
+    if start_img:
+        await bot.send_photo(message.chat.id, photo=start_img, caption=caption, reply_markup=kb_start_test())
+    else:
+        await message.answer(caption + "\n\nНажми: /test")
+
+@dp.callback_query(F.data == "start_test")
+async def cb_start_test(call: types.CallbackQuery, state: FSMContext):
+    if await throttle_callback(call):
+        return
+    await call.answer()
+    await start_free_block(call.message.chat.id, state)
+
+@dp.message(Command("test"))
+async def cmd_test(message: types.Message, state: FSMContext):
+    if await throttle_message(message):
+        return
+    await start_free_block(message.chat.id, state)
+
+async def start_free_block(chat_id: int, state: FSMContext):
+    await state.set_state(FreeTest.answering)
+    await state.update_data(idx=0, traits=[])
+    await send_free_question(chat_id, state)
+
+async def send_free_question(chat_id: int, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("idx", 0)
+
+    if idx >= len(QUESTIONS_FREE):
+        # вычисляем предварительный тип
+        traits: list[str] = data.get("traits", [])
+        mbti = mbti_from_traits(traits)
+
+        LAST_FREE_TRAITS[chat_id] = traits
+        LAST_MBTI[chat_id] = mbti
+        save_state()
+
+        short = DESCR_SHORT.get(mbti, "Короткое описание готовится.")
+
+        # экран покупки (full.png + кнопки)
+        full_img = path_or_none(ASSETS_DIR / "full.png")
+        caption = (f"<b>Предварительный тип:</b> <code>{mbti}</code>\n\n"
+                   f"{short}\n\n"
+                   "🔓 Хочешь точный результат и развёрнутый отчёт?\n"
+                   "Открой доступ и продолжим с 17 вопроса.")
+        if full_img:
+            await bot.send_photo(chat_id, photo=full_img, caption=caption, reply_markup=kb_after_free(uid=chat_id))
+        else:
+            await bot.send_message(chat_id, caption, reply_markup=kb_after_free(uid=chat_id))
+        await state.clear()
+        return
+
+    q = QUESTIONS_FREE[idx]
+    options_text = [q["options"][0]["text"], q["options"][1]["text"]]
+
+    image_path = IMAGES_DIR / "free" / f"q{idx+1}.jpg"
+    caption = f"<b>Вопрос {idx+1}/{len(QUESTIONS_FREE)}:</b>\n{q['text']}"
+
+    img = path_or_none(image_path)
+    if img:
+        await bot.send_photo(chat_id, photo=img, caption=caption, reply_markup=kb_for_question(options_text))
+    else:
+        await bot.send_message(chat_id, caption, reply_markup=kb_for_question(options_text))
+
+@dp.callback_query(FreeTest.answering, F.data.in_({"opt_0", "opt_1"}))
+async def on_answer_free(call: types.CallbackQuery, state: FSMContext):
+    if await throttle_callback(call):
+        return
+
+    data = await state.get_data()
+    idx = data.get("idx", 0)
+    q = QUESTIONS_FREE[idx]
+    chosen = 0 if call.data == "opt_0" else 1
+    trait = q["options"][chosen]["trait"]
+
+    traits: list[str] = data.get("traits", [])
+    traits.append(trait)
+    await state.update_data(idx=idx + 1, traits=traits)
+
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.answer()
+    await send_free_question(call.message.chat.id, state)
+
+# === Покупка: две кнопки — Stars и Card ===
+@dp.callback_query(F.data == "buy_stars")
+async def buy_stars(call: types.CallbackQuery):
+    if await throttle_callback(call):
+        return
+    await call.answer()
+
+    prices = [types.LabeledPrice(label="Full MBTI report", amount=settings.price_full_report)]
+    await bot.send_invoice(
+        chat_id=call.message.chat.id,
+        title="Полный MBTI-разбор",
+        description="20 уточняющих вопросов + развёрнутый отчёт.",
+        payload="full_report_stars",
+        provider_token="",          # для звёзд пусто
+        currency="XTR",             # валюта звёзд
+        prices=prices,
+        max_tip_amount=0,
+        need_name=False,
+        need_phone_number=False,
+        need_email=False,
+        need_shipping_address=False,
+    )
+
+@dp.callback_query(F.data == "buy_card")
+async def buy_card(call: types.CallbackQuery):
+    if await throttle_callback(call):
+        return
+    await call.answer()
+
+    if not settings.pay_provider_token:
+        await call.message.answer("💳 Оплата картой временно недоступна. Используй «💎 Купить за звёзды».")
+        return
+
+    prices = [types.LabeledPrice(label="Full MBTI report", amount=settings.price_full_report_card)]
+    await bot.send_invoice(
+        chat_id=call.message.chat.id,
+        title="Полный MBTI-разбор",
+        description="20 уточняющих вопросов + развёрнутый отчёт.",
+        payload="full_report_card",
+        provider_token=settings.pay_provider_token,
+        currency=settings.card_currency,  # напр. USD/EUR/RUB
+        prices=prices,
+        max_tip_amount=0,
+        need_name=False,
+        need_phone_number=False,
+        need_email=False,
+        need_shipping_address=False,
+    )
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    PAID_USERS.add(uid)
+    save_state()
+    await message.answer("✅ Оплата успешна! Продолжаем с уточняющими вопросами.")
+    await start_paid_block(message.chat.id, state)
+
+# === ПЛАТНЫЕ 20 ===
+class PaidTest(StatesGroup):
+    answering = State()
+
+async def start_paid_block(chat_id: int, state: FSMContext):
+    await state.set_state(PaidTest.answering)
+    await state.update_data(idx=0, traits=[])
+    await send_paid_question(chat_id, state)
+
+async def send_paid_question(chat_id: int, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("idx", 0)
+
+    if idx >= len(QUESTIONS_PAID):
+        paid_traits: list[str] = data.get("traits", [])
+        LAST_PAID_TRAITS[chat_id] = paid_traits
+        combined = (LAST_FREE_TRAITS.get(chat_id, []) or []) + (paid_traits or [])
+        final_mbti = mbti_from_traits(combined)
+        LAST_MBTI[chat_id] = final_mbti
+        save_state()
+
+        long_text = DESCR_LONG.get(final_mbti)
+        if not long_text:
+            short = DESCR_SHORT.get(final_mbti, "")
+            await bot.send_message(
+                chat_id,
+                f"<b>Точный тип:</b> <code>{final_mbti}</code>\n\n"
+                f"Пока нет развёрнутого текста для {final_mbti}. Держи краткий вариант:\n\n{short}"
+            )
+        else:
+            await bot.send_message(chat_id, f"<b>Точный тип:</b> <code>{final_mbti}</code>\n\n{long_text}")
+        await state.clear()
+        return
+
+    q = QUESTIONS_PAID[idx]
+    options_text = [q["options"][0]["text"], q["options"][1]["text"]]
+
+    number = 16 + idx + 1  # нумеруем 17..36
+    image_path = IMAGES_DIR / "paid" / f"q{idx+1}.jpg"
+    caption = f"<b>Уточняющий {number}/{16 + len(QUESTIONS_PAID)}:</b>\n{q['text']}"
+
+    img = path_or_none(image_path)
+    if img:
+        await bot.send_photo(chat_id, photo=img, caption=caption, reply_markup=kb_for_question(options_text))
+    else:
+        await bot.send_message(chat_id, caption, reply_markup=kb_for_question(options_text))
+
+@dp.callback_query(PaidTest.answering, F.data.in_({"opt_0", "opt_1"}))
+async def on_answer_paid(call: types.CallbackQuery, state: FSMContext):
+    if await throttle_callback(call):
+        return
+
+    data = await state.get_data()
+    idx = data.get("idx", 0)
+
+    q = QUESTIONS_PAID[idx]
+    chosen = 0 if call.data == "opt_0" else 1
+    trait = q["options"][chosen]["trait"]
+
+    traits: list[str] = data.get("traits", [])
+    traits.append(trait)
+    await state.update_data(idx=idx + 1, traits=traits)
+
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.answer()
+    await send_paid_question(call.message.chat.id, state)
+
+# === Бесплатный «развёрнутый отчёт» (для уже оплачивших) ===
+@dp.callback_query(F.data == "full_report")
+async def send_full_report(call: types.CallbackQuery):
+    if await throttle_callback(call):
+        return
+    await call.answer()
+    uid = call.from_user.id
+    if uid not in PAID_USERS:
+        await call.message.answer("Сначала открой доступ (кнопка «Купить»).")
+        return
+
+    mbti = LAST_MBTI.get(uid)
+    if not mbti:
+        await call.message.answer("Не вижу твоего результата. Начни с /start и пройди короткий тест.")
+        return
+
+    long_text = DESCR_LONG.get(mbti)
+    if not long_text:
+        short = DESCR_SHORT.get(mbti, "")
+        await call.message.answer(f"<b>Твой тип:</b> <code>{mbti}</code>\n\n{short}")
+        return
+    await call.message.answer(f"<b>Твой тип:</b> <code>{mbti}</code>\n\n{long_text}")
+
+# ===================== GROUP / FUN (бесплатно) =====================
+from random import choice as rndchoice
+import glob
+
+def _is_group(obj: types.Message | types.CallbackQuery) -> bool:
+    chat = obj.message.chat if isinstance(obj, types.CallbackQuery) else obj.chat
+    return chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
+
+@dp.message(Command("whoami"))
+async def cmd_whoami(message: types.Message):
+    if await throttle_message(message): return
+    uid = message.from_user.id
+    t = LAST_MBTI.get(uid)
+    if not t:
+        await message.reply("Я пока не знаю твой тип. Напиши мне в ЛС: /start → «Начать тест»")
+        return
+    short = DESCR_SHORT.get(t, "")
+    await message.reply(f"👤 <b>{message.from_user.first_name}</b>\nТип: <code>{t}</code>\n{short[:400]}{'…' if len(short)>400 else ''}")
+
+@dp.message(Command("daily"))
+async def cmd_daily(message: types.Message):
+    if await throttle_message(message): return
+    q = rndchoice([
+        "☀️ Что для тебя идеальный отдых?",
+        "🧠 Что недавно узнал(а), что тебя удивило?",
+        "🎯 Что хочешь успеть на этой неделе?",
+        "💬 Что тебя реально мотивирует, а что — нет?",
+        "🌍 Место, куда хочется вернуться?",
+        "📚 Книга/фильм, который зацепил недавно?",
+        "⚡ Когда нужен фокус — что тебе помогает?"
+    ])
+    await message.reply(f"<b>Вопрос дня</b>\n{q}\n\nОтветь коротко 👇")
+
+ROASTS = {
+    "ENTP": ["Вы спорите даже с чайником — он же неправ.", "Мозг — 120%, дедлайны — минус бесконечность."],
+    "ENFP": ["Идеи — океан, план — лужица.", "Вы вдохновляете всех, кроме своего To-Do."],
+    "ISTJ": ["Порядок у вас везде… кроме чужих голов.", "Сначала правила, потом чувства. И так всегда."],
+    "ISFP": ["«Сделаю, когда почувствую» — фирменная тактика.", "Творю красиво, дедлайны — эстетически игнорирую."]
+}
+COMPL = {
+    "ENTP": ["Видите 10 ходов вперёд. И шутку — на 11-м.", "Вы двигаете обсуждения туда, где становится интересно."],
+    "ENFP": ["Зажигаете людей и идеи — это редкость.", "С вами команды оживают, даже самые скучные."],
+    "ISTJ": ["На вас можно опереться. Всегда.", "Системность, которой многим не хватает."],
+    "ISFP": ["Чувствуете красоту и атмосферу. Делаете уютно.", "Где вы — там стиль и тепло."]
+}
+
+@dp.message(Command("roast"))
+async def cmd_roast(message: types.Message):
+    if await throttle_message(message): return
+    t = LAST_MBTI.get(message.from_user.id)
+    if not t:
+        await message.reply("Сначала скажи мне свой тип в ЛС — /start → «Начать тест»")
+        return
+    line = rndchoice(ROASTS.get(t, ["Сегодня без роуста — ты и так хорош(а)."]))
+    await message.reply(f"🔥 <b>Roast {t}</b>\n{line}")
+
+@dp.message(Command("compliment"))
+async def cmd_compliment(message: types.Message):
+    if await throttle_message(message): return
+    t = LAST_MBTI.get(message.from_user.id)
+    if not t:
+        await message.reply("Сначала скажи мне свой тип в ЛС — /start → «Начать тест»")
+        return
+    line = rndchoice(COMPL.get(t, ["Ты — тот человек, с кем хочется делать проекты."]))
+    await message.reply(f"💐 <b>{t}</b>\n{line}")
+
+@dp.message(Command("meme"))
+async def cmd_meme(message: types.Message):
+    if await throttle_message(message): return
+    t = LAST_MBTI.get(message.from_user.id)
+    if not t:
+        await message.reply("Не знаю твой тип. Напиши мне в ЛС: /start")
+        return
+    patt = str(DATA_DIR / "memes" / t / "*")
+    files = [p for p in glob.glob(patt) if p.lower().endswith((".jpg",".jpeg",".png",".gif"))]
+    if not files:
+        await message.reply("Пока нет мема для твоего типа. Скажи — добавлю!")
+        return
+    try:
+        await bot.send_photo(message.chat.id, photo=FSInputFile(rndchoice(files)))
+    except Exception:
+        await message.reply("Не получилось отправить мем, но я пополню коллекцию 🙈")
+
+# Мини-квиз E/I
+QUIZ_STATE: dict[int, dict] = {}
+
+@dp.message(Command("quiz"))
+async def cmd_quiz(message: types.Message):
+    if await throttle_message(message): return
+    if not _is_group(message):
+        await message.reply("Квиз работает в группах. В ЛС жми /start.")
+        return
+    text = "⚡ Мини-квиз: ты ближе к…\n① «Погнали, сделаем!»\n② «Дайте минуту подумать…»"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="① Экстраверт (E)", callback_data="quiz_e")],
+        [InlineKeyboardButton(text="② Интроверт (I)", callback_data="quiz_i")],
+    ])
+    sent = await message.reply(text, reply_markup=kb)
+    QUIZ_STATE[message.chat.id] = {"msg_id": sent.message_id, "votes": {0:set(),1:set()}}
+
+    import asyncio
+    async def close_quiz():
+        st = QUIZ_STATE.get(message.chat.id)
+        if not st or st["msg_id"] != sent.message_id:
+            return
+        v0, v1 = len(st["votes"][0]), len(st["votes"][1])
+        total = max(1, v0+v1)
+        p0, p1 = int(v0*100/total), int(v1*100/total)
+        await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=sent.message_id,
+            text=(f"✅ Итоги мини-квиза\n"
+                  f"E: {v0} ({p0}%) · I: {v1} ({p1}%)\n\n"
+                  f"Хочешь точный тип? В ЛС — /start → «Начать тест»")
+        )
+    asyncio.get_running_loop().call_later(60, lambda: asyncio.create_task(close_quiz()))
+
+@dp.callback_query(F.data.in_({"quiz_e","quiz_i"}))
+async def on_quiz_vote(call: types.CallbackQuery):
+    if await throttle_callback(call): return
+    if not _is_group(call):
+        await call.answer("Квиз — только в группе.")
+        return
+    st = QUIZ_STATE.get(call.message.chat.id)
+    if not st or st["msg_id"] != call.message.message_id:
+        await call.answer("Квиз уже закрыт.")
+        return
+    uid = call.from_user.id
+    pick = 0 if call.data=="quiz_e" else 1
+    st["votes"][0].discard(uid); st["votes"][1].discard(uid)
+    st["votes"][pick].add(uid)
+    v0, v1 = len(st["votes"][0]), len(st["votes"][1])
+    await call.answer(f"E: {v0} · I: {v1}")
+
+# Ледокол
+ICE_QUESTIONS = [
+    ("📱 Сообщения ночью лучше…", "Отвечать сразу", "Оставлять до утра"),
+    ("☕ Утро начинается с…", "Кофе и планы", "Тишины и прокрастинации"),
+    ("🎉 Выходные — это…", "Движ и люди", "Дом, фильмы, уют"),
+    ("✈️ Путешествия:", "Маршрут по пунктам", "Импровизация на месте"),
+    ("🧠 Спор:", "Важно быть правым", "Важно остаться друзьями"),
+]
+ICE_STATE: dict[int, dict] = {}
+
+@dp.message(Command("ice"))
+async def group_ice(message: types.Message):
+    if await throttle_message(message): return
+    if not _is_group(message):
+        await message.reply("Это для групп. В ЛС — /start 🙂")
+        return
+    q = rndchoice(ICE_QUESTIONS)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"① {q[1]}", callback_data="ice_0")],
+        [InlineKeyboardButton(text=f"② {q[2]}", callback_data="ice_1")],
+    ])
+    sent = await message.reply(f"🧊 <b>Ледокол</b>\n{q[0]}\n\nГолосуем 60 сек.", reply_markup=kb)
+    ICE_STATE[message.chat.id] = {"msg_id": sent.message_id, "q": q, "votes": {0:set(),1:set()}}
+
+    import asyncio
+    async def close_poll():
+        st = ICE_STATE.get(message.chat.id)
+        if not st or st["msg_id"] != sent.message_id:
+            return
+        v0 = len(st["votes"][0]); v1 = len(st["votes"][1])
+        total = max(1, v0+v1); p0 = int(v0*100/total); p1 = int(v1*100/total)
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=sent.message_id,
+            text=(f"🧊 <b>Итоги ледокола</b>\n{q[0]}\n\n"
+                  f"① {q[1]} — <b>{v0}</b> ({p0}%)\n"
+                  f"② {q[2]} — <b>{v1}</b> ({p1}%)\n\n"
+                  f"Хочешь узнать свой тип? В ЛС — /start → «Начать тест»")
+        )
+    asyncio.get_running_loop().call_later(60, lambda: asyncio.create_task(close_poll()))
+
+@dp.callback_query(F.data.in_({"ice_0","ice_1"}))
+async def on_ice_vote(call: types.CallbackQuery):
+    if await throttle_callback(call): return
+    if not _is_group(call):
+        await call.answer("Это голосование только в группах.")
+        return
+    st = ICE_STATE.get(call.message.chat.id)
+    if not st or st["msg_id"] != call.message.message_id:
+        await call.answer("Голосование закрыто.")
+        return
+    uid = call.from_user.id
+    pick = 0 if call.data=="ice_0" else 1
+    st["votes"][0].discard(uid); st["votes"][1].discard(uid)
+    st["votes"][pick].add(uid)
+    v0 = len(st["votes"][0]); v1 = len(st["votes"][1])
+    await call.answer(f"Принято! ① {v0} · ② {v1}")
+
+# Совместимость (по реплаю)
+@dp.message(Command("compat"))
+async def group_compat(message: types.Message):
+    if await throttle_message(message): return
+    if not _is_group(message):
+        await message.reply("Команда для групп. В ЛС — /start.")
+        return
+    if not message.reply_to_message:
+        await message.reply("Ответь этой командой на сообщение человека (реплай).")
+        return
+    uid1 = message.from_user.id
+    uid2 = message.reply_to_message.from_user.id
+    t1 = LAST_MBTI.get(uid1); t2 = LAST_MBTI.get(uid2)
+    if not t1 or not t2:
+        await message.reply("У кого-то нет результата. В ЛС — /start → «Начать тест»")
+        return
+
+    def score(a: str, b: str) -> int:
+        s = 0
+        s += 1 if a[1]==b[1] else 0
+        s += 1 if a[2]==b[2] else 0
+        s += 1 if a[0]!=b[0] else 0
+        s += 1 if a[3]!=b[3] else 0
+        return s
+    sc = score(t1,t2)
+    labels = {0:"⚠️ спорно",1:"🟡 так себе",2:"🟠 зависит",3:"🟢 хорошо",4:"💚 очень хорошо"}
+    await message.reply(
+        f"💞 Совместимость:\n"
+        f"{message.from_user.first_name}: <code>{t1}</code>\n"
+        f"{message.reply_to_message.from_user.first_name}: <code>{t2}</code>\n"
+        f"Оценка: <b>{labels[sc]}</b> ({sc}/4)\n"
+        f"Персональные советы — в ЛС после платного блока."
+    )
+
+# =============== MBTI SOULS: аура / архетипы / анализ ===============
+def _text_features(s: str) -> dict[str, int]:
+    emojis = sum(1 for ch in s if ord(ch) > 0x1F000 or ch in "😂😅🤣😍❤️🔥✨😎😉🙂🙃🤔😭😴🎉")
+    exc = s.count("!")
+    qmark = s.count("?")
+    length = len(s)
+    lower = s.lower()
+
+    logic_words = sum(lower.count(w) for w in ["потому", "если", "поэтому", "логич", "факт"])
+    feel_words  = sum(lower.count(w) for w in ["чувств", "кажется", "эмоц", "нрав", "душ"])
+    plan_words  = sum(lower.count(w) for w in ["план", "срок", "дедлайн", "чеклист", "структ"])
+    flow_words  = sum(lower.count(w) for w in ["свобод", "импров", "эксперим", "как пойдёт"])
+
+    score = {"E":0,"I":0,"N":0,"S":0,"T":0,"F":0,"J":0,"P":0}
+    if emojis + exc >= 2 or (length < 60 and emojis + exc >= 1):
+        score["E"] += 2
+    if qmark >= 2 or length > 120:
+        score["I"] += 1
+    if "иде" in lower or "смысл" in lower or "паттер" in lower: score["N"] += 2
+    if "факт" in lower or "практик" in lower or "пример" in lower: score["S"] += 2
+    score["T"] += logic_words
+    score["F"] += feel_words
+    score["J"] += plan_words
+    score["P"] += flow_words
+
+    return {"cnt":1, "chars":length, "emoji":emojis, "exc":exc, "qmark":qmark, **score}
+
+def _merge_feat(dest: dict[str,int], add: dict[str,int]) -> None:
+    for k,v in add.items(): dest[k] = dest.get(k,0) + v
+
+def _dominant_type_feat(d: dict[str,int]) -> str:
+    e = "E" if d.get("E",0) >= d.get("I",0) else "I"
+    n = "N" if d.get("N",0) >= d.get("S",0) else "S"
+    t = "T" if d.get("T",0) >= d.get("F",0) else "F"
+    j = "J" if d.get("J",0) >= d.get("P",0) else "P"
+    return f"{e}{n}{t}{j}"
+
+def _arch_name(mbti: str) -> str:
+    ARCHETYPES = {
+        "ENFP": "Вдохновитель 🌈", "ENFJ": "Коуч 💬", "ENTP": "Искра ⚡", "ENTJ": "Полководец 🧭",
+        "ESFP": "Шоумен 🎭", "ESFJ": "Хост 💎", "ESTP": "Драйвер 🏎", "ESTJ": "Менеджер 📊",
+        "INFP": "Мечтатель 🌙", "INFJ": "Навигатор 🔮", "INTP": "Мыслитель 🧠", "INTJ": "Стратег ♟",
+        "ISFP": "Артист 🎨", "ISFJ": "Опекун 🫶", "ISTP": "Мастер 🔧", "ISTJ": "Стабилизатор 🧱"
+    }
+    return ARCHETYPES.get(mbti, "Архетип")
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), ~F.text.startswith("/"))
+async def collect_aura(message: types.Message):
+    if not message.text:
+        return
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    feats = _text_features(message.text)
+    chat_map = AURA_STATE.setdefault(chat_id, {})
+    u = chat_map.setdefault(uid, {})
+    _merge_feat(u, feats)
+    if (u.get("cnt",0) % 10) == 0:
+        save_state()
+
+@dp.message(Command("aura"))
+async def cmd_aura(message: types.Message):
+    if await throttle_message(message): return
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    u = AURA_STATE.get(chat_id, {}).get(uid)
+    if not u:
+        await message.reply("Пока мало данных по твоей ауре. Пиши чаще, и я покажу картину 😉")
+        return
+    inferred = _dominant_type_feat(u)
+    known = LAST_MBTI.get(uid)
+    drift = f"Дрейф: <code>{known}</code> → <code>{inferred}</code>\n" if known and known != inferred else ""
+    arche = _arch_name(inferred)
+    total = u.get("cnt",0); emojis = u.get("emoji",0); exc = u.get("exc",0); qm = u.get("qmark",0); chars = u.get("chars",0)
+    await message.reply(
+        "🌌 <b>Твоя аура</b>\n"
+        f"Архетип: <b>{arche}</b> (<code>{inferred}</code>)\n"
+        f"{drift}"
+        f"Сообщений: <b>{total}</b>, символов: <b>{chars}</b>\n"
+        f"Эмодзи: {emojis} · !: {exc} · ?: {qm}\n"
+        "Пиши ещё — аура обновляется по мере общения."
+    )
+
+@dp.message(Command("souls"))
+async def cmd_souls(message: types.Message):
+    if await throttle_message(message): return
+    chat_id = message.chat.id
+    users = AURA_STATE.get(chat_id, {})
+    if not users:
+        await message.reply("Я ещё не собрал достаточно данных по чату.")
+        return
+    counts: Dict[str,int] = {}
+    for uid, feats in users.items():
+        t = _dominant_type_feat(feats)
+        counts[t] = counts.get(t,0) + 1
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    lines = [f"{_arch_name(t)} — <b>{c}</b>" for t,c in top]
+    await message.reply("🗺 <b>Карта архетипов чата</b>\n" + "\n".join(lines))
+
+@dp.message(Command("reflect"))
+async def cmd_reflect(message: types.Message):
+    if await throttle_message(message): return
+    target_text = None
+    user_name = message.from_user.first_name
+    if message.reply_to_message and message.reply_to_message.text:
+        target_text = message.reply_to_message.text
+        user_name = message.reply_to_message.from_user.first_name
+    elif message.text and len(message.text.split(maxsplit=1)) > 1:
+        target_text = message.text.split(maxsplit=1)[1]
+    if not target_text:
+        await message.reply("Отправь /reflect в ответ на сообщение — я проанализирую тон и «энергию».")
+        return
+    fts = _text_features(target_text)
+    t = _dominant_type_feat(fts)
+    vibe = []
+    if fts["emoji"] + fts["exc"] >= 2: vibe.append("эмоционально")
+    if fts["qmark"] >= 2: vibe.append("вопросительно/рефлексивно")
+    if fts["T"] > fts["F"]: vibe.append("логично")
+    if fts["F"] > fts["T"]: vibe.append("эмпатично")
+    if fts["J"] > fts["P"]: vibe.append("структурно")
+    if fts["P"] > fts["J"]: vibe.append("импровизационно")
+    vibe_txt = ", ".join(vibe) if vibe else "нейтрально"
+    await message.reply(f"✴️ <b>Эхо личности</b>\n{user_name} звучит как <code>{t}</code> — {vibe_txt}.\nХочешь точнее? В ЛС — /start.")
+
+# === main ===
+async def main() -> None:
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
