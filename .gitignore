@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+app/data/state.json
+app/data/tests/**/images/
+app/data/images/
