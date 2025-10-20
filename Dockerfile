@@ -28,4 +28,4 @@ COPY . .
 HEALTHCHECK --interval=10s --timeout=2s --retries=5 CMD curl -fsS http://127.0.0.1:${PORT}/ || exit 1
 
 # Поднимаем health-сервер и бота
-CMD bash -lc "python -m app.health & exec python -m app.bot"
+CMD bash -lc "python app/health.py & exec python -m app.bot"
