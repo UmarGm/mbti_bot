@@ -86,6 +86,7 @@ def load_tests() -> Dict[str, Dict[str, Any]]:
             continue
         tests[slug] = {
             "title": qdata.get("meta", {}).get("title", TITLE_ALIAS.get(slug, slug)),
+            "type": qdata.get("meta", {}).get("type", "traits"),
             "questions": questions,
             "results": rdata,
             "dir": slug_path
@@ -242,17 +243,61 @@ def score_to_mbti(score: Dict[str, int]) -> str:
 async def compute_result(slug: str, state: FSMContext) -> str:
     data = await state.get_data()
     stash: Dict[str, str] = data.get("stash", {})
-    score: Dict[str, int] = {}
-    for trait in stash.values():
-        if not trait: continue
-        score[trait] = score.get(trait, 0) + 1
-    if slug == "mbti":
-        typ = score_to_mbti(score)
-        desc = TESTS[slug]["results"].get(typ, "Описание недоступно.")
-        return f"🏁 Твой тип: <b>{typ}</b>\n{desc}"
-    top = sorted(score.items(), key=lambda x: -x[1])[:3]
+    test = TESTS.get(slug, {})
+    ttype = test.get("type", "traits")
+
+    # Разбор stash
+    trait_score: Dict[str, int] = {}
+    total_score = 0
+    for raw in stash.values():
+        if not raw:
+            continue
+        if raw.startswith("t:"):
+            trait = raw[2:]
+            if not trait: 
+                continue
+            trait_score[trait] = trait_score.get(trait, 0) + 1
+        elif raw.startswith("s:"):
+            try:
+                total_score += int(raw[2:])
+            except Exception:
+                pass
+
+    # MBTI — собираем тип
+    if slug == "mbti" or ttype == "mbti":
+        typ = score_to_mbti(trait_score)
+        desc = test.get("results", {}).get(typ, "Описание недоступно.")
+        return f"🏁 Твой тип: <b>{typ}</b>
+{desc}"
+
+    # Тесты с суммой баллов — выбираем band
+    if ttype == "sum":
+        rdata = test.get("results", {})
+        bands = rdata.get("bands", [])
+        fmt = rdata.get("format", "<b>{title}</b>
+
+{text}")
+        picked = None
+        for b in bands:
+            try:
+                if int(b.get("min", -10**9)) <= total_score <= int(b.get("max", 10**9)):
+                    picked = b
+                    break
+            except Exception:
+                continue
+        if not picked and bands:
+            # если диапазоны не покрыли сумму — возьмём ближайший по min
+            bands_sorted = sorted(bands, key=lambda x: (x.get("min", 0)))
+            picked = bands_sorted[0] if total_score < bands_sorted[0].get("min", 0) else bands_sorted[-1]
+        if picked:
+            return fmt.format(title=picked.get("title","—"), text=picked.get("text",""))
+        return "🏁 Результат: нет данных"
+
+    # Fallback: по «топ-черты»
+    top = sorted(trait_score.items(), key=lambda x: -x[1])[:3]
     top_str = ", ".join([f"{k}:{v}" for k,v in top]) if top else "нет данных"
-    return f"🏁 Результат «{TESTS[slug]['title']}»:\n<b>{top_str}</b>"
+    return f"🏁 Результат «{TESTS[slug]['title']}»:
+<b>{top_str}</b>"
 
 # ===================== Router =====================
 
@@ -263,8 +308,13 @@ def make_q_kb(slug: str, idx: int, q: Dict[str, Any]) -> InlineKeyboardMarkup:
     row: List[InlineKeyboardButton] = []
     for opt in q.get("options", []):
         btn_text = opt.get("text", "—")
-        trait = opt.get("trait", "")
-        row.append(InlineKeyboardButton(text=btn_text, callback_data=f"ans:{slug}:{idx}:{trait}"))
+        if "trait" in opt and opt.get("trait"):
+            val = f"t:{opt.get('trait')}"
+        elif "score" in opt:
+            val = f"s:{opt.get('score')}"
+        else:
+            val = "t:"  # пустое значение, чтобы не падало
+        row.append(InlineKeyboardButton(text=btn_text, callback_data=f"ans:{slug}:{idx}:{val}"))
         if len(row) == 2:
             rows.append(row); row = []
     if row: rows.append(row)
@@ -372,14 +422,15 @@ async def cb_ans(call: CallbackQuery, state: FSMContext, bot: Bot):
         await call.answer("Тесты доступны только в ЛС.", show_alert=True)
         return
     try:
-        _, slug, idx_str, trait = call.data.split(":", 3)
+        _, slug, idx_str, val = call.data.split(":", 3)
         idx = int(idx_str)
     except Exception:
         await call.answer()
         return
     data = await state.get_data()
     stash: Dict[str, str] = data.get("stash", {})
-    stash[str(idx)] = trait
+    # сохраняем как есть (val: 't:E' или 's:1')
+    stash[str(idx)] = val
     await state.update_data(stash=stash, index=idx+1)
     await render_question(call.message.chat.id, state, bot)
     await call.answer()
