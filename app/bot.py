@@ -1,47 +1,39 @@
-# app/bot.py — исправленная версия
-# aiogram 3.10+
-# исправлена логика подсчёта результатов для MBTI и суммовых тестов
-
 import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List, Optional
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, FSInputFile
+    Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile, InputMediaPhoto
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("mbti_bot_fixed")
+log = logging.getLogger("mbti_bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN не задан. Укажи переменную окружения BOT_TOKEN")
+    raise SystemExit("❌ BOT_TOKEN не задан в окружении")
 
 # Пути
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 TESTS_DIR = DATA_DIR / "tests"
 
-# FSM ключи
+# FSM keys
 ACTIVE_MSG_KEY = "active_msg_id"
 AUX_MSG_KEY = "aux_msg_id"
 ACTIVE_KIND_KEY = "active_msg_kind"
 
-# Загрузка тестов
+# === Загрузка тестов ===
 def load_tests() -> Dict[str, Dict[str, Any]]:
     tests: Dict[str, Dict[str, Any]] = {}
-    if not TESTS_DIR.exists():
-        log.warning("tests dir not found: %s", TESTS_DIR)
-        return tests
     for slug_path in TESTS_DIR.iterdir():
         if not slug_path.is_dir():
             continue
@@ -49,43 +41,29 @@ def load_tests() -> Dict[str, Dict[str, Any]]:
         qf = slug_path / "questions.json"
         rf = slug_path / "results.json"
         if not qf.exists() or not rf.exists():
-            log.warning("skip test (missing files): %s", slug)
             continue
         try:
             qdata = json.loads(qf.read_text(encoding="utf-8"))
             rdata = json.loads(rf.read_text(encoding="utf-8"))
         except Exception as e:
-            log.warning("skip test %s: %s", slug, e)
-            continue
-        questions = qdata.get("questions", [])
-        if not isinstance(questions, list) or not questions:
-            log.warning("skip test (empty/bad questions): %s", slug)
+            log.warning("Ошибка загрузки %s: %s", slug, e)
             continue
         tests[slug] = {
             "title": qdata.get("meta", {}).get("title", slug),
             "type": qdata.get("meta", {}).get("type", "traits"),
-            "questions": questions,
+            "questions": qdata.get("questions", []),
             "results": rdata,
             "dir": slug_path
         }
-    log.info("Loaded %d tests from %s", len(tests), TESTS_DIR)
+    log.info("Загружено тестов: %d", len(tests))
     return tests
 
 
-TESTS: Dict[str, Dict[str, Any]] = load_tests()
+TESTS = load_tests()
 
-# ===== Утилиты =====
+# === Утилиты ===
 def is_private(chat_type: str) -> bool:
     return chat_type == "private"
-
-def find_brand_image(kind: str) -> Optional[str]:
-    roots = [DATA_DIR / "branding", DATA_DIR / "images" / "branding"]
-    for root in roots:
-        for ext in ("png", "jpg", "jpeg", "webp"):
-            p = root / f"{kind}.{ext}"
-            if p.exists():
-                return str(p)
-    return None
 
 async def _store_msg_id(state: FSMContext, key: str, msg_id: Optional[int]):
     data = await state.get_data()
@@ -97,22 +75,25 @@ async def _get_msg_id(state: FSMContext, key: str) -> Optional[int]:
     return data.get(key)
 
 async def replace_message(
-    bot: Bot, chat_id: int, state: FSMContext,
+    bot: Bot,
+    chat_id: int,
+    state: FSMContext,
     text: Optional[str] = None,
     photo: Optional[str] = None,
-    reply_markup: Optional[InlineKeyboardMarkup] = None
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ):
     try:
+        msg_id = await _get_msg_id(state, ACTIVE_MSG_KEY)
         if photo:
             media = InputMediaPhoto(media=FSInputFile(photo), caption=text)
-            await bot.edit_message_media(media=media, chat_id=chat_id, message_id=(await _get_msg_id(state, ACTIVE_MSG_KEY)), reply_markup=reply_markup)
+            await bot.edit_message_media(media=media, chat_id=chat_id, message_id=msg_id, reply_markup=reply_markup)
         else:
-            await bot.edit_message_text(text, chat_id, (await _get_msg_id(state, ACTIVE_MSG_KEY)), reply_markup=reply_markup)
+            await bot.edit_message_text(text, chat_id, msg_id, reply_markup=reply_markup)
     except Exception:
         msg = await bot.send_message(chat_id, text or "—", reply_markup=reply_markup)
         await _store_msg_id(state, ACTIVE_MSG_KEY, msg.message_id)
 
-# ====== Основная логика тестов ======
+# === Основная логика тестов ===
 
 def score_to_mbti(score: Dict[str, int]) -> str:
     e = "E" if score.get("E", 0) >= score.get("I", 0) else "I"
@@ -120,7 +101,6 @@ def score_to_mbti(score: Dict[str, int]) -> str:
     t = "T" if score.get("T", 0) >= score.get("F", 0) else "F"
     j = "J" if score.get("J", 0) >= score.get("P", 0) else "P"
     return f"{e}{s}{t}{j}"
-
 
 async def compute_result(slug: str, state: FSMContext) -> str:
     data = await state.get_data()
@@ -175,8 +155,7 @@ async def compute_result(slug: str, state: FSMContext) -> str:
     top_str = ", ".join([f"{k}:{v}" for k, v in top]) if top else "нет данных"
     return f"🏁 Результат «{TESTS[slug]['title']}»:\n<b>{top_str}</b>"
 
-
-# ======= Интерфейс =======
+# === Интерфейс ===
 router = Router()
 
 def make_q_kb(slug: str, idx: int, q: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -192,12 +171,12 @@ def make_q_kb(slug: str, idx: int, q: Dict[str, Any]) -> InlineKeyboardMarkup:
             val = "t:"
         row.append(InlineKeyboardButton(text=btn_text, callback_data=f"ans:{slug}:{idx}:{val}"))
         if len(row) == 2:
-            rows.append(row); row = []
+            rows.append(row)
+            row = []
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 async def render_question(chat_id: int, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -211,23 +190,28 @@ async def render_question(chat_id: int, state: FSMContext, bot: Bot):
     total = len(qs)
     if idx >= total:
         result_text = await compute_result(slug, state)
-        img = find_brand_image("full")
-        await replace_message(bot, chat_id, state, text=result_text, photo=img)
+        await replace_message(bot, chat_id, state, text=result_text)
         return
     q = qs[idx]
-    text = f"<b>{q.get('text','')}</b>\n\n({idx+1}/{total})"
+    text = f"<b>{q.get('text', '')}</b>\n\n({idx + 1}/{total})"
     kb = make_q_kb(slug, idx, q)
-    await replace_message(bot, chat_id, state, text=text, reply_markup=kb)
 
+    # добавляем фото, если есть
+    photo_path = test["dir"] / f"{idx + 1}.jpg"
+    if not photo_path.exists():
+        photo_path = test["dir"] / f"{idx + 1}.png"
+    if photo_path.exists():
+        await replace_message(bot, chat_id, state, text=text, photo=str(photo_path), reply_markup=kb)
+    else:
+        await replace_message(bot, chat_id, state, text=text, reply_markup=kb)
 
 @router.message(Command("start"))
 async def cmd_start(msg: Message, state: FSMContext, bot: Bot):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t["title"], callback_data=f"start:{slug}")]
-        for slug, t in TESTS.items()
-    ])
-    await msg.answer("📋 Выбери тест:", reply_markup=kb)
-
+    rows = []
+    for slug, t in TESTS.items():
+        rows.append([InlineKeyboardButton(text=t["title"], callback_data=f"start:{slug}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await msg.answer("👋 Выбери тест ниже:", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("start:"))
 async def cb_start(call: CallbackQuery, state: FSMContext, bot: Bot):
@@ -236,15 +220,10 @@ async def cb_start(call: CallbackQuery, state: FSMContext, bot: Bot):
     await render_question(call.message.chat.id, state, bot)
     await call.answer()
 
-
 @router.callback_query(F.data.startswith("ans:"))
 async def cb_ans(call: CallbackQuery, state: FSMContext, bot: Bot):
-    try:
-        _, slug, idx_str, val = call.data.split(":", 3)
-        idx = int(idx_str)
-    except Exception:
-        await call.answer()
-        return
+    _, slug, idx_str, val = call.data.split(":", 3)
+    idx = int(idx_str)
     data = await state.get_data()
     stash: Dict[str, str] = data.get("stash", {})
     stash[str(idx)] = val
@@ -252,19 +231,14 @@ async def cb_ans(call: CallbackQuery, state: FSMContext, bot: Bot):
     await render_question(call.message.chat.id, state, bot)
     await call.answer()
 
-
-# ======= MAIN =======
+# === MAIN ===
 async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-    except Exception:
-        pass
-
-    log.info("✅ MBTI bot started")
+    await bot.delete_webhook(drop_pending_updates=False)
+    log.info("✅ MBTI бот запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
